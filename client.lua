@@ -117,7 +117,6 @@ local function handle_stage_one_end(data)
         
         if lower_bound and upper_bound then
             log_info(string.format("第一阶段完成，范围: %.1fs - %.1fs", lower_bound, upper_bound))
-            log_info("将重新连接进行第二阶段探测...")
             return lower_bound
         end
     end
@@ -188,9 +187,10 @@ local function run_tcp_client()
         
         local last_probe_time = 0
         local connected = true
-        local stage_completed = false
+        local should_reconnect = false  -- 标记是否需要重新连接
+        local phase_completed = false   -- 标记当前阶段是否完成
         
-        while connected and not stage_completed do
+        while connected and not phase_completed do
             -- 接收数据
             local data, err = client:receive()
             if data then
@@ -217,8 +217,9 @@ local function run_tcp_client()
                     client_state.last_successful_interval = handle_stage_one_end(data)
                     if client_state.last_successful_interval then
                         client_state.stage = "stage_two"
-                        stage_completed = true
-                        log_info("将重新连接进行第二阶段探测...")
+                        should_reconnect = true  -- 需要重新连接进行第二阶段
+                        phase_completed = true   -- 当前阶段完成
+                        log_info("准备重新连接进行第二阶段探测...")
                     end
                 -- 检查是否是第二阶段就绪信号
                 elseif data:find("STAGE_TWO_READY", 1, true) then
@@ -249,7 +250,7 @@ local function run_tcp_client()
                             log_info(string.format("建议设置心跳间隔: %.1fs", lower * 0.8))
                         end
                     end
-                    stage_completed = true
+                    phase_completed = true  -- 整个探测完成
                 else
                     log_debug("收到其他数据: " .. data)
                 end
@@ -270,14 +271,19 @@ local function run_tcp_client()
         
         client:close()
         
-        if stage_completed and client_state.stage == "stage_two" then
-            -- 第二阶段完成，退出
+        -- 检查是否需要退出或重新连接
+        if phase_completed and client_state.stage == "stage_two" and not should_reconnect then
+            -- 第二阶段真正完成，退出
             log_info("第二阶段探测完成")
             break
         elseif not connected then
             -- 连接断开，等待后重试
             log_info("连接断开，等待5秒后重试...")
             socket.sleep(5)
+        elseif should_reconnect then
+            -- 第一阶段完成，立即重新连接进行第二阶段
+            log_info("立即重新连接进行第二阶段探测...")
+            socket.sleep(1)  -- 短暂等待确保服务器准备好
         end
     end
     
@@ -359,7 +365,7 @@ local function run_udp_client()
         -- 检查是否超时（超过60秒没收到探测包）
         if last_probe_time > 0 and socket.gettime() - last_probe_time > 60 then
             log_warn("超过60秒未收到探测包，UDP NAT映射可能已过期")
-            log_info("总共收到 " .. probe_count .. " 个UDP探测包")
+            log_info("总共收到 " .. probe_count .. " 个探测包")
             running = false
         end
         
