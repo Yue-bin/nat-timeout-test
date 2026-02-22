@@ -238,11 +238,11 @@ local function handle_client(client, protocol, client_info)
         local start_interval = last_successful_interval
         local end_interval = last_successful_interval * 2
         
-        -- 确认客户端准备好
+        -- 立即确认客户端准备好
         client:send("STAGE_TWO_READY|" .. start_interval .. "|" .. end_interval .. "\n")
         log_info("发送第二阶段就绪信号")
         
-        -- 等待客户端确认
+        -- 等待客户端确认（如果有的话）
         socket.sleep(1)
         
         -- 执行第二阶段探测
