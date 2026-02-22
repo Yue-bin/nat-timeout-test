@@ -1,6 +1,6 @@
 #!/usr/bin/env lua
 -- NAT超时时间检测 - 客户端
--- 支持TCP和UDP协议
+-- 支持TCP和UDP协议，支持两阶段探测算法
 
 local socket = require("socket")
 
@@ -79,12 +79,46 @@ local function log_debug(msg) log_msg("DEBUG", msg) end
 local function log_warn(msg) log_msg("WARN", msg) end
 local function log_error(msg) log_msg("ERROR", msg) end
 
--- TCP客户端
-local function run_tcp_client()
-    local host = config.server_host
-    local port = config.tcp_port
-    local bind_host = config.bind_host
+-- 解析探测包
+local function parse_probe_packet(data)
+    local parts = {}
+    for part in data:gmatch("[^|]+") do
+        table.insert(parts, part)
+    end
     
+    if #parts >= 4 then
+        return {
+            magic = parts[1],
+            stage = parts[2],
+            timestamp = tonumber(parts[3]),
+            interval = tonumber(parts[4])
+        }
+    end
+    return nil
+end
+
+-- 处理第一阶段结束信号
+local function handle_stage_one_end(data)
+    local parts = {}
+    for part in data:gmatch("[^|]+") do
+        table.insert(parts, part)
+    end
+    
+    if #parts >= 3 and parts[1] == "STAGE_ONE_END" then
+        local lower_bound = tonumber(parts[2])
+        local upper_bound = tonumber(parts[3])
+        
+        if lower_bound and upper_bound then
+            log_info(string.format("第一阶段完成，范围: %.1fs - %.1fs", lower_bound, upper_bound))
+            log_info("将重新连接进行第二阶段探测...")
+            return lower_bound
+        end
+    end
+    return nil
+end
+
+-- 连接TCP服务器
+local function connect_tcp_server(host, port, bind_host)
     log_info("连接TCP服务器: " .. host .. ":" .. port)
     log_info("绑定地址: " .. bind_host)
     
@@ -92,7 +126,7 @@ local function run_tcp_client()
     local client = socket.tcp()
     if not client then
         log_error("创建TCP客户端失败")
-        return false
+        return nil
     end
     
     -- 绑定到指定地址（可选）
@@ -109,62 +143,125 @@ local function run_tcp_client()
     local ok, err = client:connect(host, port)
     if not ok then
         log_error("连接TCP服务器失败: " .. tostring(err))
-        return false
+        return nil
     end
     
     client:settimeout(0)  -- 非阻塞
     log_info("TCP连接建立成功")
-    log_info("等待服务器探测...")
+    return client
+end
+
+-- TCP客户端（支持两阶段）
+local function run_tcp_client()
+    local host = config.server_host
+    local port = config.tcp_port
+    local bind_host = config.bind_host
     
-    local last_probe_time = 0
-    local connected = true
+    local stage = "stage_one"
+    local last_successful_interval = nil
     local probe_count = 0
     
-    while connected do
-        -- 接收数据
-        local data, err = client:receive()
-        if data then
-            -- 检查是否是探测包
-            if data:find(config.magic_string, 1, true) then
-                last_probe_time = socket.gettime()
-                probe_count = probe_count + 1
-                
-                -- 解析探测包信息
-                local parts = {}
-                for part in data:gmatch("[^|]+") do
-                    table.insert(parts, part)
-                end
-                
-                if #parts >= 3 then
-                    local probe_interval = tonumber(parts[3]) or 0
-                    log_info(string.format("收到第%d个探测包，间隔: %.1fs", probe_count, probe_interval))
+    while true do
+        -- 连接服务器
+        local client = connect_tcp_server(host, port, bind_host)
+        if not client then
+            log_error("无法连接服务器")
+            return false
+        end
+        
+        -- 根据阶段发送初始信息
+        if stage == "stage_two" and last_successful_interval then
+            local handshake = "FINE_PROBE_START|" .. last_successful_interval
+            client:send(handshake .. "\n")
+            log_info("发送第二阶段握手: " .. handshake)
+        else
+            log_info("等待服务器探测...")
+        end
+        
+        local last_probe_time = 0
+        local connected = true
+        local stage_completed = false
+        
+        while connected and not stage_completed do
+            -- 接收数据
+            local data, err = client:receive()
+            if data then
+                -- 检查是否是探测包
+                if data:find(config.magic_string, 1, true) then
+                    local probe = parse_probe_packet(data)
+                    if probe then
+                        last_probe_time = socket.gettime()
+                        probe_count = probe_count + 1
+                        
+                        log_info(string.format("收到第%d个探测包，阶段: %s, 间隔: %.1fs", 
+                            probe_count, probe.stage, probe.interval))
+                        
+                        -- 回应服务器
+                        local response = "PROBE_ACK|" .. socket.gettime() .. "|" .. probe_count
+                        client:send(response .. "\n")
+                        log_debug("发送回应: " .. response)
+                    else
+                        log_debug("收到探测包但解析失败: " .. data)
+                    end
+                -- 检查是否是第一阶段结束信号
+                elseif data:find("STAGE_ONE_END", 1, true) then
+                    log_info("收到第一阶段结束信号")
+                    last_successful_interval = handle_stage_one_end(data)
+                    if last_successful_interval then
+                        stage = "stage_two"
+                        stage_completed = true
+                        log_info("将重新连接进行第二阶段探测...")
+                    end
+                -- 检查是否是第二阶段就绪信号
+                elseif data:find("STAGE_TWO_READY", 1, true) then
+                    log_info("收到第二阶段就绪信号: " .. data)
+                -- 检查是否是最终结果
+                elseif data:find("FINAL_RESULT", 1, true) then
+                    log_info("收到最终结果: " .. data)
+                    local parts = {}
+                    for part in data:gmatch("[^|]+") do
+                        table.insert(parts, part)
+                    end
+                    if #parts >= 3 then
+                        local lower = tonumber(parts[2])
+                        local upper = tonumber(parts[3])
+                        if lower and upper then
+                            log_info(string.format("精确NAT超时时间: %.1fs - %.1fs", lower, upper))
+                            log_info(string.format("建议设置心跳间隔: %.1fs", lower * 0.8))
+                        end
+                    end
+                    stage_completed = true
                 else
-                    log_debug("收到探测包: " .. data)
+                    log_debug("收到其他数据: " .. data)
                 end
-                
-                -- 回应服务器
-                local response = "PROBE_ACK|" .. socket.gettime() .. "|" .. probe_count
-                client:send(response .. "\n")
-                log_debug("发送回应: " .. response)
-            else
-                log_debug("收到非探测数据: " .. data)
+            elseif err ~= "timeout" then
+                log_error("接收数据错误: " .. tostring(err))
+                connected = false
             end
-        elseif err ~= "timeout" then
-            log_error("接收数据错误: " .. tostring(err))
-            connected = false
+            
+            -- 检查是否超时（超过30秒没收到探测包）
+            if last_probe_time > 0 and socket.gettime() - last_probe_time > 30 then
+                log_warn("超过30秒未收到探测包，连接可能已断开")
+                log_info("总共收到 " .. probe_count .. " 个探测包")
+                connected = false
+            end
+            
+            socket.sleep(0.1)  -- 避免CPU占用过高
         end
         
-        -- 检查是否超时（超过30秒没收到探测包）
-        if last_probe_time > 0 and socket.gettime() - last_probe_time > 30 then
-            log_warn("超过30秒未收到探测包，连接可能已断开")
-            log_info("总共收到 " .. probe_count .. " 个探测包")
-            connected = false
-        end
+        client:close()
         
-        socket.sleep(0.1)  -- 避免CPU占用过高
+        if stage_completed and stage == "stage_two" then
+            -- 第二阶段完成，退出
+            log_info("第二阶段探测完成")
+            break
+        elseif not connected then
+            -- 连接断开，等待后重试
+            log_info("连接断开，等待5秒后重试...")
+            socket.sleep(5)
+        end
     end
     
-    client:close()
     log_info("TCP客户端退出")
     return true
 end
@@ -222,8 +319,8 @@ local function run_udp_client()
                     table.insert(parts, part)
                 end
                 
-                if #parts >= 3 then
-                    local probe_interval = tonumber(parts[3]) or 0
+                if #parts >= 4 then
+                    local probe_interval = tonumber(parts[4]) or 0
                     log_info(string.format("收到第%d个UDP探测包，间隔: %.1fs", probe_count, probe_interval))
                 else
                     log_debug("收到UDP探测包: " .. data)
