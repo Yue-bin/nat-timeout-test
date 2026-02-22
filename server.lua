@@ -181,8 +181,8 @@ local function handle_client(client, protocol, client_info)
     local stage = "stage_one"  -- 默认从第一阶段开始
     local last_successful_interval = nil
     
-    -- 设置接收超时
-    client:settimeout(5)
+    -- 设置接收超时为10秒，给客户端更多时间发送握手信号
+    client:settimeout(10)
     
     -- 接收客户端初始信息
     local data, err = client:receive()
@@ -202,6 +202,8 @@ local function handle_client(client, protocol, client_info)
                 log_info("客户端请求第二阶段探测，上次成功间隔: " .. tostring(last_successful_interval))
             end
         end
+    else
+        log_debug("未收到客户端初始信息: " .. tostring(err))
     end
     
     -- 重置为非阻塞
