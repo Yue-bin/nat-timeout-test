@@ -201,6 +201,8 @@ local function handle_client(client, protocol, client_info)
                 last_successful_interval = tonumber(parts[2])
                 log_info("客户端请求第二阶段探测，上次成功间隔: " .. tostring(last_successful_interval))
             end
+        else
+            log_debug("客户端发送了其他信息: " .. data)
         end
     else
         log_debug("未收到客户端初始信息: " .. tostring(err))
@@ -240,7 +242,7 @@ local function handle_client(client, protocol, client_info)
         
         -- 立即确认客户端准备好
         client:send("STAGE_TWO_READY|" .. start_interval .. "|" .. end_interval .. "\n")
-        log_info("发送第二阶段就绪信号")
+        log_info("发送第二阶段就绪信号: STAGE_TWO_READY|" .. start_interval .. "|" .. end_interval)
         
         -- 等待客户端确认（如果有的话）
         socket.sleep(1)
