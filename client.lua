@@ -172,8 +172,10 @@ local function run_tcp_client()
         -- 根据阶段发送初始信息
         if stage == "stage_two" and last_successful_interval then
             local handshake = "FINE_PROBE_START|" .. last_successful_interval
+            -- 立即发送握手信号，不要等待
             client:send(handshake .. "\n")
             log_info("发送第二阶段握手: " .. handshake)
+            log_debug("握手信号已发送，等待服务器响应...")
         else
             log_info("等待服务器探测...")
         end
@@ -205,7 +207,7 @@ local function run_tcp_client()
                     end
                 -- 检查是否是第一阶段结束信号
                 elseif data:find("STAGE_ONE_END", 1, true) then
-                    log_info("收到第一阶段结束信号")
+                    log_info("收到第一阶段结束信号: " .. data)
                     last_successful_interval = handle_stage_one_end(data)
                     if last_successful_interval then
                         stage = "stage_two"
@@ -215,6 +217,17 @@ local function run_tcp_client()
                 -- 检查是否是第二阶段就绪信号
                 elseif data:find("STAGE_TWO_READY", 1, true) then
                     log_info("收到第二阶段就绪信号: " .. data)
+                    local parts = {}
+                    for part in data:gmatch("[^|]+") do
+                        table.insert(parts, part)
+                    end
+                    if #parts >= 3 then
+                        local start = tonumber(parts[2])
+                        local end_interval = tonumber(parts[3])
+                        if start and end_interval then
+                            log_info(string.format("第二阶段探测范围: %.1fs - %.1fs", start, end_interval))
+                        end
+                    end
                 -- 检查是否是最终结果
                 elseif data:find("FINAL_RESULT", 1, true) then
                     log_info("收到最终结果: " .. data)
