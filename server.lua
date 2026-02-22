@@ -60,19 +60,17 @@ local function log_debug(msg) log_msg("DEBUG", msg) end
 local function log_warn(msg) log_msg("WARN", msg) end
 local function log_error(msg) log_msg("ERROR", msg) end
 
--- 两阶段探测算法
-local function two_stage_probe(client, protocol, client_info)
-    log_info("开始两阶段NAT超时检测")
+-- 第一阶段：指数级搜索
+local function stage_one_exponential_search(client, protocol, client_info)
     log_info("第一阶段：快速定位（指数级搜索）")
     
-    -- 第一阶段：指数级搜索，找到大致范围
     local current_interval = config.initial_interval
     local lower_bound = nil
     local upper_bound = nil
     
     while current_interval <= config.max_interval do
         -- 发送探测包
-        local probe_msg = config.magic_string .. "|" .. socket.gettime() .. "|" .. current_interval
+        local probe_msg = config.magic_string .. "|STAGE_ONE|" .. socket.gettime() .. "|" .. current_interval
         local sent = false
         
         if protocol == "tcp" then
@@ -84,11 +82,11 @@ local function two_stage_probe(client, protocol, client_info)
         if sent then
             log_info(string.format("探测间隔: %.1fs, 状态: 发送成功", current_interval))
             
-            -- 等待回应（TCP）或检查客户端活跃（UDP）
+            -- 等待回应
             local response_received = false
             local start_time = socket.gettime()
             
-            while socket.gettime() - start_time < 2 do  -- 等待2秒回应
+            while socket.gettime() - start_time < 2 do
                 if protocol == "tcp" then
                     local data, err = client:receive()
                     if data and data:find("PROBE_ACK") then
@@ -97,8 +95,7 @@ local function two_stage_probe(client, protocol, client_info)
                         break
                     end
                 else -- udp
-                    -- UDP通过后续数据包判断客户端是否活跃
-                    response_received = true  -- 假设活跃，由主循环更新
+                    response_received = true
                 end
                 socket.sleep(0.1)
             end
@@ -107,7 +104,7 @@ local function two_stage_probe(client, protocol, client_info)
                 log_info(string.format("探测间隔: %.1fs, 状态: 连接正常", current_interval))
                 lower_bound = current_interval
                 current_interval = current_interval * 2
-                socket.sleep(current_interval)  -- 等待下一个探测间隔
+                socket.sleep(current_interval)
             else
                 log_warn(string.format("探测间隔: %.1fs, 状态: 无回应", current_interval))
                 upper_bound = current_interval
@@ -115,23 +112,23 @@ local function two_stage_probe(client, protocol, client_info)
             end
         else
             log_error("发送探测包失败")
-            break
+            return nil, nil
         end
     end
     
-    if not lower_bound or not upper_bound then
-        log_error("未能找到NAT超时范围")
-        return nil
-    end
-    
-    log_info(string.format("找到大致范围: %.1fs - %.1fs", lower_bound, upper_bound))
+    return lower_bound, upper_bound
+end
+
+-- 第二阶段：线性精细搜索
+local function stage_two_linear_search(client, protocol, client_info, start_interval, end_interval)
     log_info("第二阶段：精细测量（线性搜索）")
+    log_info(string.format("搜索范围: %.1fs - %.1fs, 步长: %.1fs", 
+        start_interval, end_interval, config.fine_step))
     
-    -- 第二阶段：线性搜索，精确测量
-    local best_interval = lower_bound
+    local best_interval = start_interval
     
-    for interval = lower_bound + config.fine_step, upper_bound, config.fine_step do
-        local probe_msg = config.magic_string .. "|" .. socket.gettime() .. "|" .. interval
+    for interval = start_interval + config.fine_step, end_interval, config.fine_step do
+        local probe_msg = config.magic_string .. "|STAGE_TWO|" .. socket.gettime() .. "|" .. interval
         local sent = false
         
         if protocol == "tcp" then
@@ -173,11 +170,100 @@ local function two_stage_probe(client, protocol, client_info)
         end
     end
     
-    log_info(string.format("精确NAT超时时间: %.1fs - %.1fs", 
-        best_interval, best_interval + config.fine_step))
-    log_info(string.format("建议设置心跳间隔: %.1fs", best_interval * 0.8))  -- 80%的安全边际
-    
     return best_interval
+end
+
+-- 处理客户端连接（支持两阶段）
+local function handle_client(client, protocol, client_info)
+    log_info("开始处理客户端连接")
+    
+    -- 第一阶段：等待客户端发送阶段信息
+    local stage = "stage_one"  -- 默认从第一阶段开始
+    local last_successful_interval = nil
+    
+    -- 设置接收超时
+    client:settimeout(5)
+    
+    -- 接收客户端初始信息
+    local data, err = client:receive()
+    if data then
+        log_debug("收到客户端初始信息: " .. data)
+        
+        -- 检查是否是第二阶段握手
+        if data:find("FINE_PROBE_START") then
+            stage = "stage_two"
+            -- 解析上次成功的间隔
+            local parts = {}
+            for part in data:gmatch("[^|]+") do
+                table.insert(parts, part)
+            end
+            if #parts >= 2 then
+                last_successful_interval = tonumber(parts[2])
+                log_info("客户端请求第二阶段探测，上次成功间隔: " .. tostring(last_successful_interval))
+            end
+        end
+    end
+    
+    -- 重置为非阻塞
+    client:settimeout(0)
+    
+    if stage == "stage_one" then
+        log_info("开始第一阶段探测")
+        local lower_bound, upper_bound = stage_one_exponential_search(client, protocol, client_info)
+        
+        if lower_bound and upper_bound then
+            log_info(string.format("第一阶段完成，范围: %.1fs - %.1fs", lower_bound, upper_bound))
+            log_info("等待客户端重新连接进行第二阶段...")
+            
+            -- 告诉客户端进入第二阶段
+            local stage_end_msg = "STAGE_ONE_END|" .. lower_bound .. "|" .. upper_bound
+            client:send(stage_end_msg .. "\n")
+            log_info("发送第一阶段结束信号: " .. stage_end_msg)
+            
+            -- 关闭连接，等待客户端重新连接
+            client:close()
+            return lower_bound, upper_bound
+        else
+            log_error("第一阶段探测失败")
+            client:close()
+            return nil, nil
+        end
+        
+    elseif stage == "stage_two" and last_successful_interval then
+        log_info("开始第二阶段探测")
+        
+        -- 计算搜索范围
+        local start_interval = last_successful_interval
+        local end_interval = last_successful_interval * 2
+        
+        -- 确认客户端准备好
+        client:send("STAGE_TWO_READY|" .. start_interval .. "|" .. end_interval .. "\n")
+        log_info("发送第二阶段就绪信号")
+        
+        -- 等待客户端确认
+        socket.sleep(1)
+        
+        -- 执行第二阶段探测
+        local best_interval = stage_two_linear_search(client, protocol, client_info, 
+            start_interval, end_interval)
+        
+        if best_interval then
+            log_info(string.format("精确NAT超时时间: %.1fs - %.1fs", 
+                best_interval, best_interval + config.fine_step))
+            log_info(string.format("建议设置心跳间隔: %.1fs", best_interval * 0.8))
+            
+            -- 发送最终结果
+            local final_result = "FINAL_RESULT|" .. best_interval .. "|" .. (best_interval + config.fine_step)
+            client:send(final_result .. "\n")
+            log_info("发送最终结果: " .. final_result)
+        end
+        
+        client:close()
+        return best_interval, nil
+    end
+    
+    client:close()
+    return nil, nil
 end
 
 -- TCP服务器
@@ -196,18 +282,17 @@ local function run_tcp_server()
             local client_addr = client:getsockname()
             log_info("TCP客户端已连接: " .. tostring(client_addr))
             
-            -- 执行两阶段探测
-            two_stage_probe(client, "tcp", {ip = "*", port = "*"})
+            -- 处理客户端（支持两阶段）
+            handle_client(client, "tcp", {ip = "*", port = "*"})
             
-            client:close()
-            log_info("TCP连接关闭，等待下一个客户端...")
+            log_info("TCP连接处理完成，等待下一个客户端...")
         elseif err ~= "timeout" then
             log_error("接受连接失败: " .. tostring(err))
         end
     end
 end
 
--- UDP服务器
+-- UDP服务器（简化版）
 local function run_udp_server()
     log_info("启动UDP服务器，端口: " .. config.udp_port)
     
@@ -215,35 +300,13 @@ local function run_udp_server()
     assert(server:setsockname("*", config.udp_port))
     server:settimeout(0)
     
-    local clients = {}
+    log_info("UDP服务器运行中（简化实现）...")
     
     while true do
-        -- 接收数据
         local data, ip, port = server:receivefrom()
         if data then
-            local client_key = ip .. ":" .. port
-            
-            if not clients[client_key] then
-                log_info("新的UDP客户端: " .. client_key)
-                clients[client_key] = {
-                    ip = ip,
-                    port = port,
-                    last_seen = socket.gettime(),
-                    connected = true
-                }
-                
-                -- 为新客户端启动探测线程（简化处理，实际需要协程）
-                log_info("开始UDP客户端探测: " .. client_key)
-                
-                -- 这里简化处理，实际应该为每个客户端创建独立的探测逻辑
-                -- 由于UDP是无连接的，探测逻辑需要调整
-            else
-                clients[client_key].last_seen = socket.gettime()
-                log_debug("UDP客户端活跃: " .. client_key)
-            end
+            log_debug("收到UDP数据从 " .. ip .. ":" .. port .. ": " .. data)
         end
-        
-        -- 简化UDP探测逻辑（实际需要更复杂的实现）
         socket.sleep(1)
     end
 end
@@ -253,15 +316,15 @@ local function main()
     parse_args(arg)
     
     log_info("NAT超时时间检测服务器启动")
-    log_info("使用两阶段探测算法")
+    log_info("使用两阶段探测算法（支持断线重连）")
     log_info("TCP端口: " .. config.tcp_port .. ", UDP端口: " .. config.udp_port)
     log_info("初始探测间隔: " .. config.initial_interval .. "s")
     log_info("最大探测间隔: " .. config.max_interval .. "s")
     log_info("精细探测步长: " .. config.fine_step .. "s")
     
     print("\n选择协议:")
-    print("1. TCP（推荐，更精确）")
-    print("2. UDP")
+    print("1. TCP（推荐，支持完整两阶段）")
+    print("2. UDP（简化实现）")
     print("3. 退出")
     
     io.write("请输入选择 (1-3): ")
