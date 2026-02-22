@@ -14,6 +14,13 @@ local config = {
     log_level = "INFO"
 }
 
+-- 全局状态变量
+local client_state = {
+    stage = "stage_one",
+    last_successful_interval = nil,
+    probe_count = 0
+}
+
 -- 命令行参数解析
 local function parse_args(args)
     local parsed = {
@@ -157,12 +164,8 @@ local function run_tcp_client()
     local port = config.tcp_port
     local bind_host = config.bind_host
     
-    -- 使用闭包保持状态
-    local state = {
-        stage = "stage_one",
-        last_successful_interval = nil,
-        probe_count = 0
-    }
+    log_debug("当前状态: stage=" .. client_state.stage .. 
+              ", last_interval=" .. tostring(client_state.last_successful_interval))
     
     while true do
         -- 连接服务器
@@ -173,8 +176,8 @@ local function run_tcp_client()
         end
         
         -- 根据阶段发送初始信息
-        if state.stage == "stage_two" and state.last_successful_interval then
-            local handshake = "FINE_PROBE_START|" .. state.last_successful_interval
+        if client_state.stage == "stage_two" and client_state.last_successful_interval then
+            local handshake = "FINE_PROBE_START|" .. client_state.last_successful_interval
             -- 立即发送握手信号，不要等待
             client:send(handshake .. "\n")
             log_info("发送第二阶段握手: " .. handshake)
@@ -196,13 +199,13 @@ local function run_tcp_client()
                     local probe = parse_probe_packet(data)
                     if probe then
                         last_probe_time = socket.gettime()
-                        state.probe_count = state.probe_count + 1
+                        client_state.probe_count = client_state.probe_count + 1
                         
                         log_info(string.format("收到第%d个探测包，阶段: %s, 间隔: %.1fs", 
-                            state.probe_count, probe.stage, probe.interval))
+                            client_state.probe_count, probe.stage, probe.interval))
                         
                         -- 回应服务器
-                        local response = "PROBE_ACK|" .. socket.gettime() .. "|" .. state.probe_count
+                        local response = "PROBE_ACK|" .. socket.gettime() .. "|" .. client_state.probe_count
                         client:send(response .. "\n")
                         log_debug("发送回应: " .. response)
                     else
@@ -211,9 +214,9 @@ local function run_tcp_client()
                 -- 检查是否是第一阶段结束信号
                 elseif data:find("STAGE_ONE_END", 1, true) then
                     log_info("收到第一阶段结束信号: " .. data)
-                    state.last_successful_interval = handle_stage_one_end(data)
-                    if state.last_successful_interval then
-                        state.stage = "stage_two"
+                    client_state.last_successful_interval = handle_stage_one_end(data)
+                    if client_state.last_successful_interval then
+                        client_state.stage = "stage_two"
                         stage_completed = true
                         log_info("将重新连接进行第二阶段探测...")
                     end
@@ -258,7 +261,7 @@ local function run_tcp_client()
             -- 检查是否超时（超过30秒没收到探测包）
             if last_probe_time > 0 and socket.gettime() - last_probe_time > 30 then
                 log_warn("超过30秒未收到探测包，连接可能已断开")
-                log_info("总共收到 " .. state.probe_count .. " 个探测包")
+                log_info("总共收到 " .. client_state.probe_count .. " 个探测包")
                 connected = false
             end
             
@@ -267,7 +270,7 @@ local function run_tcp_client()
         
         client:close()
         
-        if stage_completed and state.stage == "stage_two" then
+        if stage_completed and client_state.stage == "stage_two" then
             -- 第二阶段完成，退出
             log_info("第二阶段探测完成")
             break
