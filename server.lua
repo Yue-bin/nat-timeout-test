@@ -16,8 +16,7 @@ local config = {
 }
 
 -- 命令行参数解析
-local function parse_args()
-    local args = {...}
+local function parse_args(args)
     local parsed = {}
     
     for i = 1, #args do
@@ -251,7 +250,7 @@ end
 
 -- 主函数
 local function main()
-    parse_args()
+    parse_args(arg)
     
     log_info("NAT超时时间检测服务器启动")
     log_info("使用两阶段探测算法")
