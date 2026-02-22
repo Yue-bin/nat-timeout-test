@@ -7,6 +7,7 @@ local socket = require("socket")
 -- 配置
 local config = {
     server_host = "127.0.0.1",  -- 服务器地址
+    bind_host = "0.0.0.0",      -- 绑定地址
     tcp_port = 12345,
     udp_port = 12346,
     magic_string = "NAT_PROBE_v1",
@@ -14,12 +15,12 @@ local config = {
 }
 
 -- 命令行参数解析
-local function parse_args()
-    local args = {...}
+local function parse_args(args)
     local parsed = {
         protocol = "tcp",
         host = config.server_host,
-        port = nil
+        port = nil,
+        bind = config.bind_host
     }
     
     for i = 1, #args do
@@ -32,6 +33,11 @@ local function parse_args()
         elseif args[i] == "--protocol" and args[i+1] then
             parsed.protocol = args[i+1]:lower()
             i = i + 1
+        elseif args[i] == "--bind" and args[i+1] then
+            parsed.bind = args[i+1]
+            i = i + 1
+        elseif args[i] == "--help" or args[i] == "-h" then
+            return {help = true}
         end
     end
     
@@ -45,6 +51,11 @@ local function parse_args()
         config.server_host = parsed.host
     end
     
+    if parsed.bind then
+        config.bind_host = parsed.bind
+    end
+    
+    parsed.protocol = parsed.protocol or "tcp"
     return parsed
 end
 
@@ -72,12 +83,32 @@ local function log_error(msg) log_msg("ERROR", msg) end
 local function run_tcp_client()
     local host = config.server_host
     local port = config.tcp_port
+    local bind_host = config.bind_host
     
     log_info("连接TCP服务器: " .. host .. ":" .. port)
+    log_info("绑定地址: " .. bind_host)
     
-    local client = socket.connect(host, port)
+    -- 创建TCP客户端
+    local client = socket.tcp()
     if not client then
-        log_error("连接TCP服务器失败")
+        log_error("创建TCP客户端失败")
+        return false
+    end
+    
+    -- 绑定到指定地址（可选）
+    if bind_host ~= "0.0.0.0" then
+        local ok, err = client:bind(bind_host, 0)  -- 0表示系统分配端口
+        if not ok then
+            log_warn("绑定到 " .. bind_host .. " 失败: " .. tostring(err))
+        else
+            log_info("已绑定到: " .. bind_host)
+        end
+    end
+    
+    -- 连接服务器
+    local ok, err = client:connect(host, port)
+    if not ok then
+        log_error("连接TCP服务器失败: " .. tostring(err))
         return false
     end
     
@@ -142,11 +173,29 @@ end
 local function run_udp_client()
     local host = config.server_host
     local port = config.udp_port
+    local bind_host = config.bind_host
     
     log_info("连接UDP服务器: " .. host .. ":" .. port)
+    log_info("绑定地址: " .. bind_host)
     
     local client = assert(socket.udp())
-    assert(client:setpeername(host, port))
+    
+    -- 绑定到指定地址
+    local ok, err = client:setsockname(bind_host, 0)  -- 0表示系统分配端口
+    if not ok then
+        log_error("绑定UDP套接字失败: " .. tostring(err))
+        return false
+    end
+    
+    log_info("UDP套接字绑定成功: " .. bind_host)
+    
+    -- 设置对端地址
+    ok, err = client:setpeername(host, port)
+    if not ok then
+        log_error("设置UDP对端地址失败: " .. tostring(err))
+        return false
+    end
+    
     client:settimeout(0)  -- 非阻塞
     
     -- 先发送一个初始包让服务器知道我们的地址
@@ -214,27 +263,28 @@ local function show_help()
     print("  --host <地址>     服务器地址（默认: 127.0.0.1）")
     print("  --port <端口>     服务器端口（默认: 12345）")
     print("  --protocol <协议> 协议: tcp 或 udp（默认: tcp）")
-    print("  --help            显示此帮助信息")
+    print("  --bind <地址>     绑定地址（默认: 0.0.0.0）")
+    print("  --help, -h        显示此帮助信息")
     print()
     print("示例:")
     print("  lua client.lua --host 192.168.1.100 --protocol tcp")
     print("  lua client.lua --host example.com --port 54321 --protocol udp")
+    print("  lua client.lua --host server.com --bind 192.168.1.50 --protocol tcp")
 end
 
 -- 主函数
 local function main()
-    local args = parse_args()
+    local args = parse_args(arg)
     
     -- 检查是否需要显示帮助
-    for _, arg in ipairs({...}) do
-        if arg == "--help" or arg == "-h" then
-            show_help()
-            return
-        end
+    if args.help then
+        show_help()
+        return
     end
     
     log_info("NAT超时时间检测客户端启动")
     log_info("服务器地址: " .. config.server_host)
+    log_info("绑定地址: " .. config.bind_host)
     
     if args.protocol == "tcp" then
         log_info("使用TCP协议，端口: " .. config.tcp_port)
@@ -259,4 +309,5 @@ else
     print("\n使用示例:")
     print("lua client.lua --host 192.168.1.100 --protocol tcp")
     print("lua client.lua --host example.com --port 54321 --protocol udp")
+    print("lua client.lua --host server.com --bind 192.168.1.50 --protocol tcp")
 end
